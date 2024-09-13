@@ -5,9 +5,6 @@ from typing import Dict, Optional, Tuple
 
 import flwr as fl
 import torch
-from flwr_datasets import FederatedDataset
-from torch.utils.data import DataLoader
-
 import utils
 
 warnings.filterwarnings("ignore")
@@ -38,16 +35,9 @@ def evaluate_config(server_round: int):
 
 def get_evaluate_fn(model: torch.nn.Module, toy: bool):
     """Return an evaluation function for server-side evaluation."""
+    print('Running custom evaluation')
 
-    # Load data here to avoid the overhead of doing it in `evaluate` itself
-    centralized_data = utils.load_centralized_data()
-    if toy:
-        # use only 10 samples as validation set
-        centralized_data = centralized_data.select(range(10))
-
-    val_loader = DataLoader(centralized_data, batch_size=16)
-
-    # The `evaluate` function will be called after every round
+    # No centralized data is needed since server does not perform evaluation
     def evaluate(
         server_round: int,
         parameters: fl.common.NDArrays,
@@ -58,10 +48,23 @@ def get_evaluate_fn(model: torch.nn.Module, toy: bool):
         state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
         model.load_state_dict(state_dict, strict=True)
 
-        loss, accuracy = utils.test(model, val_loader)
-        return loss, {"accuracy": accuracy}
+        # No evaluation logic on the server, evaluation happens on clients
+        return 0.0, {"accuracy": 0.0}  # Placeholder, as the server does not evaluate
 
     return evaluate
+
+
+class CustomFedAvg(fl.server.strategy.FedAvg):
+    def aggregate_fit(
+        self, rnd: int, results, failures
+    ):
+        """Aggregate fit results and print client results."""
+        print(f"Round {rnd} - Results from clients:")
+        for i, (client, fit_res) in enumerate(results):
+            print(f"Client {i} - Loss: {fit_res.metrics.get('val_loss')}, Accuracy: {fit_res.metrics.get('val_accuracy')}")
+        
+        # Call the original FedAvg aggregation (to perform normal FedAvg aggregation)
+        return super().aggregate_fit(rnd, results, failures)
 
 
 def main():
@@ -83,38 +86,46 @@ def main():
         type=str,
         default="efficientnet",
         choices=["efficientnet", "alexnet"],
-        help="Use either Efficientnet or Alexnet models. \
-             If you want to achieve differential privacy, please use the Alexnet model",
+        help="Use either EfficientNet or AlexNet models. \
+             If you want to achieve differential privacy, please use the AlexNet model",
     )
 
     args = parser.parse_args()
 
+    # Load the selected model
     if args.model == "alexnet":
         model = utils.load_alexnet(classes=10)
     else:
         model = utils.load_efficientnet(classes=10)
 
+    # Initialize model parameters
     model_parameters = [val.cpu().numpy() for _, val in model.state_dict().items()]
 
-    # Create strategy
-    strategy = fl.server.strategy.FedAvg(
+    print('Initializing strategy')
+
+    # Create the FedAvg strategy
+    strategy = CustomFedAvg(
         fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=2,
         min_evaluate_clients=2,
-        min_available_clients=10,
+        min_available_clients=2,
         evaluate_fn=get_evaluate_fn(model, args.toy),
         on_fit_config_fn=fit_config,
         on_evaluate_config_fn=evaluate_config,
-        initial_parameters=fl.common.ndarrays_to_parameters(model_parameters),
+        initial_parameters=fl.common.ndarrays_to_parameters(model_parameters)
     )
+
+    print('Starting server')
 
     # Start Flower server for four rounds of federated learning
     fl.server.start_server(
-        server_address="192.168.20.3:8080",
+        server_address="172.19.109.124:8080",
         config=fl.server.ServerConfig(num_rounds=4),
         strategy=strategy,
     )
+
+    print('Finished setting up server')
 
 
 if __name__ == "__main__":
